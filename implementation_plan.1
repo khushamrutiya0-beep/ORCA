@@ -1,0 +1,239 @@
+# Revised Implementation Plan: ORCA MVP (Marine Ecosystem Reasoning with Collaborative Agents)
+
+This is the revised, focused architecture and implementation plan for the **ORCA MVP**. It prioritizes a single, complete, end-to-end **killer workflow**, strictly uses verified unauthenticated live data endpoints, and maintains transparent data provenance (`LIVE`, `DEMO`, `UNAVAILABLE`).
+
+---
+
+## 1. Data Source & Dependency Matrix (LIVE vs. DEMO vs. CREDENTIALS)
+
+To ensure zero ambiguity and avoid any simulated data masquerading as live telemetry, here is the exact classification of every component in the MVP:
+
+| Component | Source / Protocol | Access Mode | Status Classification | Verified Endpoint / Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Ocean Waves, Swell, SST & Currents** | Open-Meteo Marine API | Public, Unauthenticated | **`LIVE`** | `https://marine-api.open-meteo.com/v1/marine`<br>Hourly: `wave_height`, `wave_direction`, `wave_period`, `wind_wave_height`, `swell_wave_height`, `ocean_current_velocity`, `ocean_current_direction`, `sea_surface_temperature`. |
+| **Wind, Gusts, Pressure & Weather** | Open-Meteo Forecast API | Public, Unauthenticated | **`LIVE`** | `https://api.open-meteo.com/v1/forecast`<br>Hourly & Current: `wind_speed_10m`, `wind_direction_10m`, `wind_gusts_10m`, `precipitation`, `surface_pressure`, `weather_code`. |
+| **Geospatial Reference (Ports & MPAs)** | Local GeoJSON Reference Assets | Offline Bundled Asset | **`REFERENCE / STATIC`** | Curated official coordinates for major Indian coastal ports and Marine Protected Areas (MPAs). |
+| **Potential Fishing Zones (PFZ)** | `IncoisPfzProvider` | Modular Interface | **`DEMO`** (Default) / **`LIVE`** (Optional) | INCOIS does not publish a free, unauthenticated public REST API for live JSON feeds. The provider defaults to an authentic, clearly labelled **`DEMO`** advisory sample dataset unless an authenticated proxy/feed is configured in environment variables. |
+| **AI Language Model (Planner & Synthesizer)** | Google Gemini API (`@google/genai` or Vercel AI SDK) | API Key in `.env.local` | **`DEPENDENT ON CREDENTIAL`** (Server-side only) | `GEMINI_API_KEY` configured in server environment variables. Never exposed to browser. |
+| **Decision-Support Engine** | ORCA Deterministic Safety Rules | TypeScript Core Engine | **`DETERMINISTIC LOGIC`** | **Prototype decision-support model based on documented meteorological/ocean criteria**. (No claim of official IMD/WMO government certification). |
+
+---
+
+## 2. The Primary Killer Workflow
+
+**Target User Query:** *"Is it safe to venture into the sea tomorrow morning from my selected location?"*
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User / Fisherman
+    participant UI as Interactive Marine UI (Map + Chat)
+    participant Orchestrator as Planner Agent (/api/chat)
+    participant WeatherAgent as Weather Agent
+    participant OceanAgent as Ocean Agent
+    participant GeoAgent as Geospatial Agent
+    participant RiskEngine as Deterministic Risk Engine
+    participant LLM as Explanatory Synthesizer
+
+    User->>UI: Selects location on map + asks safety query for tomorrow morning
+    UI->>Orchestrator: POST { coordinates: { lat, lon }, timeWindow: "tomorrow_morning", query: "..." }
+    
+    par Multi-Agent Parallel Gathering
+        Orchestrator->>WeatherAgent: Fetch forecast (wind, gusts, precipitation, pressure)
+        WeatherAgent->>OpenMeteoWeather: GET /v1/forecast (Verified Live API)
+        OpenMeteoWeather-->>WeatherAgent: Hourly forecast data
+        WeatherAgent-->>Orchestrator: WeatherObservation (LIVE)
+    and
+        Orchestrator->>OceanAgent: Fetch marine state (waves, swell, SST, currents)
+        OceanAgent->>OpenMeteoMarine: GET /v1/marine (Verified Live API)
+        OpenMeteoMarine-->>OceanAgent: Hourly marine data
+        OceanAgent-->>Orchestrator: OceanObservation (LIVE)
+    and
+        Orchestrator->>GeoAgent: Check distance to nearest port & MPA geofences
+        GeoAgent-->>Orchestrator: GeospatialAssessment (REFERENCE)
+    end
+
+    Orchestrator->>RiskEngine: Evaluate combined telemetry (Weather + Ocean + Geospatial)
+    Note over RiskEngine: Pure TypeScript computation:<br/>Beaufort scale, wave hazard tiers,<br/>gust risk, distance to shelter
+    RiskEngine-->>Orchestrator: RiskAssessment { level: "CAUTION", score: 62, primaryHazards: [...], rulesTriggered: [...] }
+
+    Orchestrator->>LLM: Synthesize explanation using verified facts + RiskAssessment
+    Note over LLM: Grounded in evidence only.<br/>Cannot alter risk rating.
+    LLM-->>Orchestrator: Natural language advice with actionable guidance
+
+    Orchestrator-->>UI: { answer, riskAssessment, rawEvidence, statusBadges, visualCoordinates }
+    UI->>UI: Render response, Evidence Card (sources/timestamps), and update Map layer
+```
+
+---
+
+## 3. Strict Data Contract & Provider Interface
+
+Every observation and data metric implements this unified contract:
+
+```typescript
+export type DataStatus = 'LIVE' | 'DELAYED' | 'DEMO' | 'UNAVAILABLE';
+
+export interface DataErrorState {
+  code: 'NETWORK_ERROR' | 'PARSING_ERROR' | 'OUT_OF_BOUNDS' | 'UPSTREAM_FAILURE';
+  message: string;
+  timestamp: string;
+}
+
+export interface MarineMetric<T> {
+  value: T | null;             // null if unavailable (never fake default)
+  unit: string;               // e.g. "m", "km/h", "hPa", "°C"
+  timestamp: string;          // ISO 8601 observation or forecast time
+  source: string;             // e.g. "Open-Meteo Marine (ECMWF/Copernicus)"
+  status: DataStatus;         // LIVE | DELAYED | DEMO | UNAVAILABLE
+  errorState?: DataErrorState | null;
+}
+
+export interface OceanObservation {
+  waveHeight: MarineMetric<number>;
+  waveDirection: MarineMetric<number>;
+  wavePeriod: MarineMetric<number>;
+  swellWaveHeight: MarineMetric<number>;
+  seaSurfaceTemperature: MarineMetric<number>;
+  oceanCurrentVelocity: MarineMetric<number>;
+}
+
+export interface WeatherObservation {
+  windSpeed: MarineMetric<number>;
+  windGusts: MarineMetric<number>;
+  windDirection: MarineMetric<number>;
+  surfacePressure: MarineMetric<number>;
+  precipitation: MarineMetric<number>;
+  weatherCode: MarineMetric<number>;
+}
+```
+
+### Degraded State Handling
+- If Open-Meteo is unreachable or coordinates are inland/out-of-domain:
+  - Metric returns `{ value: null, status: 'UNAVAILABLE', errorState: { code: 'UPSTREAM_FAILURE', message: '...' } }`.
+  - UI displays `DATA_UNAVAILABLE` with a gray badge.
+  - Risk engine marks relevant hazard checks as `INSUFFICIENT_DATA` rather than passing blindly.
+
+---
+
+## 4. ORCA Prototype Decision-Support Model (Risk Engine)
+
+The deterministic safety engine is defined as an **ORCA prototype decision-support model based on documented meteorological/ocean criteria**:
+
+### Core Hazard Evaluation Matrices (Pure TypeScript):
+
+1. **Wind Force (Beaufort Criteria)**:
+   - `< 20 km/h` (< 11 knots): **Normal**
+   - `20 - 38 km/h` (11 - 21 knots): **Moderate** (Caution for small non-motorized craft)
+   - `39 - 61 km/h` (22 - 33 knots): **Strong Wind Hazard** (Advisory for small fishing boats)
+   - `> 61 km/h` (> 33 knots): **Severe Gale / Storm Hazard** (Dangerous for all small/medium vessels)
+
+2. **Sea State & Significant Wave Height**:
+   - `< 1.25 m`: **Smooth to Slight** (Safe)
+   - `1.25 m - 2.5 m`: **Moderate** (Caution for small crafts)
+   - `2.5 m - 4.0 m`: **Rough** (Hazardous for small/medium craft)
+   - `> 4.0 m`: **Very Rough / High** (Prohibited / Extreme Danger)
+
+3. **Geospatial & Proximity Factors**:
+   - Distance to nearest shelter port (> 25 NM adds caution factor).
+   - Intersection with Marine Protected Areas (No-take / Conservation Geofence).
+
+4. **Composite Risk Output**:
+   ```typescript
+   export type RiskLevel = 'SAFE' | 'CAUTION' | 'HAZARDOUS' | 'PROHIBITED' | 'INSUFFICIENT_DATA';
+
+   export interface RiskAssessment {
+     level: RiskLevel;
+     score: number; // 0 to 100
+     summary: string;
+     primaryHazards: string[];
+     rulesTriggered: {
+       ruleId: string;
+       description: string;
+       threshold: string;
+       observed: string;
+       severity: 'LOW' | 'MEDIUM' | 'HIGH';
+     }[];
+     disclaimer: "ORCA prototype decision-support output based on documented meteorological criteria. Not an official government directive.";
+   }
+   ```
+
+---
+
+## 5. Technical Stack
+
+- **Framework**: Next.js 14/15 (App Router, TypeScript, React 18/19)
+- **Styling**: Tailwind CSS + Lucide Icons (Dark tactical marine theme)
+- **Geospatial / Mapping**: Leaflet & React-Leaflet (Ocean basemap, vector markers, distance measurement, geofence polygons)
+- **Spatial Computations**: Turf.js (`@turf/turf`)
+- **AI Orchestration**: Google Gemini API via `@google/genai` (Server-side tool calling and structured response synthesis)
+
+---
+
+## 6. Revised 7-Day Day-by-Day Implementation Roadmap
+
+```
+Day 1 ───► Scaffolding, Data Contracts, UI Layout Shell (Split: Map + Chat)
+Day 2 ───► Verified Live Providers (Open-Meteo Marine + Weather) with Live Status Pipeline
+Day 3 ───► Deterministic Risk Engine & Geospatial Geofence Module
+Day 4 ───► Multi-Agent Pipeline (Planner -> Weather, Ocean, Geo, Risk -> AI Synthesizer)
+Day 5 ───► Interactive Tactical Marine Map (Click-to-inspect, wave vectors, hazard overlays)
+Day 6 ───► End-to-End Killer Workflow Integration & Evidence Inspector UI
+Day 7 ───► Error Handling, Degraded State Testing, UI Polish & Vercel Deployment Verification
+```
+
+### Day 1: Scaffolding, Data Contracts & Layout Shell
+- Initialize Next.js with TypeScript and Tailwind.
+- Implement unified type contracts (`MarineMetric`, `DataStatus`, `RiskAssessment`, `OceanObservation`, `WeatherObservation`).
+- Create responsive tactical layout with top observation status bar, map viewport (left), and AI intelligence pane (right).
+
+### Day 2: Verified Live Providers (Open-Meteo Integration)
+- Implement `OpenMeteoMarineProvider` using verified endpoint `https://marine-api.open-meteo.com/v1/marine`.
+- Implement `OpenMeteoWeatherProvider` using verified endpoint `https://api.open-meteo.com/v1/forecast`.
+- Implement `IncoisPfzProvider` interface with static `DEMO` advisory sample dataset clearly tagged as `DEMO`.
+- Build server-side proxy routes with strict error handling and `LIVE` vs `UNAVAILABLE` vs `DEMO` status generation.
+
+### Day 3: Deterministic Risk Engine & Geospatial Layer
+- Implement `ORCARiskEngine` with documented Beaufort, wave height, and gust threshold matrices.
+- Add Indian coastal ports reference list and Marine Protected Areas GeoJSON.
+- Add spatial calculation using Turf.js: Distance to nearest safe port and geofence boundary checks.
+- Add automated unit tests for risk score calculations across calm, moderate, and severe weather states.
+
+### Day 4: Multi-Agent Orchestration
+- Implement `PlannerAgent` that decomposes user queries and triggers specialized agent tools.
+- Implement `WeatherAgent`, `OceanAgent`, `GeospatialAgent`, and `RiskAgent`.
+- Wire Gemini server-side tool calling to guarantee the AI uses Risk Engine results as ground truth.
+
+### Day 5: Interactive Tactical Marine Map
+- Implement React-Leaflet map with ocean tile layer.
+- Render target coordinates pin, wave/wind direction vector icons, port markers, and geofence boundaries.
+- Map click interaction: Clicking any coordinate on the ocean triggers real-time data fetch and safety check for that point.
+
+### Day 6: Killer Workflow End-to-End Integration
+- Wire the complete query flow: *"Is it safe to venture into the sea tomorrow morning from my selected location?"*
+- Build the **Evidence & Source Card** in the chat UI: Collapsible drawer displaying exact API sources, UTC timestamps, raw metric values, units, and `LIVE`/`DEMO`/`UNAVAILABLE` status badges.
+- Verify that clicking quick queries updates both chat and map in sync.
+
+### Day 7: Degraded State Validation, Polish & Deployment
+- Test edge cases: Network disconnection, inland coordinates, missing wave data (gracefully showing `DATA_UNAVAILABLE`).
+- Verify build (`npm run build`) and responsiveness across desktop and mobile.
+- Generate walkthrough documentation and deployment instructions.
+
+---
+
+## 7. Verification Plan
+
+### Automated Verification
+1. `npm run build` passes with zero TypeScript errors.
+2. Risk Engine test suite: Run pure test assertions verifying that high waves (> 3.5m) or gale winds (> 50 km/h) deterministically return `HAZARDOUS` or `PROHIBITED`.
+3. Open-Meteo API integration test: Confirm HTTP 200 and valid JSON parsing for coastal coordinates (e.g. Mumbai `18.92, 72.83` and Chennai `13.08, 80.27`).
+
+### Manual User Verification (Killer Workflow)
+1. **Interactive Location Select**: Click on an offshore point in the Arabian Sea or Bay of Bengal.
+2. **Safety Query**: Ask *"Is it safe to venture into the sea tomorrow morning?"*.
+3. **Inspect Output**:
+   - Verify Planner Agent coordinates sub-agents.
+   - Verify Ocean & Weather metrics display with `LIVE` green status badges and source attribution.
+   - Verify Risk Engine returns an objective risk level (e.g. `SAFE` / `CAUTION`).
+   - Verify Map highlights the target location with wind/wave arrows and nearest port distance.
+4. **Offline / Out-of-Bounds Test**: Query a landlocked location (e.g., central India). Verify ocean metrics show `DATA_UNAVAILABLE` without crashing or inventing fake wave heights.
